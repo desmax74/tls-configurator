@@ -28,18 +28,14 @@ RUN microdnf update -y && \
     microdnf install -y ca-certificates && \
     microdnf clean all
 
-# Create non-root user
-RUN groupadd -g 1000 app && \
-    useradd -u 1000 -g app -s /bin/bash -m app
-
 # Copy binary from builder
 COPY --from=builder /tls-configurator /usr/local/bin/tls-configurator
 
-# Set ownership
-RUN chown app:app /usr/local/bin/tls-configurator
+# Set ownership to the numeric non-root UID (no shadow-utils in ubi-minimal)
+RUN chown 1000:0 /usr/local/bin/tls-configurator
 
-# Switch to non-root user
-USER app
+# Switch to non-root user (numeric UID; group 0 for OpenShift arbitrary-UID compatibility)
+USER 1000
 
 # Set entrypoint
 ENTRYPOINT ["/usr/local/bin/tls-configurator"]
