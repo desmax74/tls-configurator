@@ -16,7 +16,7 @@ A Golang application for managing TLS configurations in OpenShift IngressControl
 
 ## Requirements
 
-- Go 1.25 or later
+- Go 1.26 or later
 - OpenShift 4.22 or later
 - Access to an OpenShift cluster with appropriate permissions
 - kubectl/oc CLI configured (for local development)
