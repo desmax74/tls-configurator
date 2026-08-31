@@ -7,6 +7,8 @@ import (
 	configv1 "github.com/openshift/api/config/v1"
 	configclient "github.com/openshift/client-go/config/clientset/versioned"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/fields"
+	"k8s.io/apimachinery/pkg/watch"
 	"k8s.io/client-go/rest"
 )
 
@@ -35,6 +37,18 @@ func (c *APIServerClient) GetAPIServer(ctx context.Context) (*configv1.APIServer
 		return nil, fmt.Errorf("failed to get APIServer cluster: %w", err)
 	}
 	return apiServer, nil
+}
+
+// WatchAPIServer returns a watch on the cluster APIServer resource so callers
+// can react to runtime changes of the cluster-wide TLS security profile.
+func (c *APIServerClient) WatchAPIServer(ctx context.Context) (watch.Interface, error) {
+	w, err := c.configClient.ConfigV1().APIServers().Watch(ctx, metav1.ListOptions{
+		FieldSelector: fields.OneTermEqualSelector("metadata.name", "cluster").String(),
+	})
+	if err != nil {
+		return nil, fmt.Errorf("failed to watch APIServer cluster: %w", err)
+	}
+	return w, nil
 }
 
 // GetClusterTLSProfile retrieves the cluster-wide TLS security profile

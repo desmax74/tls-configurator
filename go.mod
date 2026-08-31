@@ -1,6 +1,6 @@
 module github.com/openshift/tls-configurator
 
-go 1.25.7
+go 1.26.7
 
 require (
 	github.com/onsi/ginkgo/v2 v2.22.2

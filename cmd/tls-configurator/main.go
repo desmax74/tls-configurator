@@ -22,37 +22,59 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"os/signal"
 	"strings"
+	"syscall"
+	"time"
 
 	configv1 "github.com/openshift/api/config/v1"
 	"github.com/openshift/tls-configurator/pkg/client"
 	"github.com/openshift/tls-configurator/pkg/config"
 	"github.com/openshift/tls-configurator/pkg/controller"
 	"github.com/openshift/tls-configurator/pkg/crypto"
+	"github.com/openshift/tls-configurator/pkg/reconcile"
 )
 
 var (
 	kubeconfig        = flag.String("kubeconfig", "", "Path to kubeconfig file (uses in-cluster config if not set)")
 	ingressController = flag.String("ingress-controller", "default", "Name of the IngressController to modify")
 	namespace         = flag.String("namespace", "openshift-ingress-operator", "Namespace of the IngressController")
-	action            = flag.String("action", "get", "Action to perform: get, update, list, get-cluster, show-tlsconfig, check-version")
+	action            = flag.String("action", "get", "Action to perform: get, update, list, get-cluster, show-tlsconfig, check-version, validate, reconcile")
 	tlsType           = flag.String("type", "Custom", "TLS profile type: Custom, Intermediate, Modern, Old")
 	minTLSVersion     = flag.String("min-tls-version", "VersionTLS13", "Minimum TLS version: VersionTLS10, VersionTLS11, VersionTLS12, VersionTLS13")
 	ciphers           = flag.String("ciphers", "", "Comma-separated list of ciphers")
 	useCluster        = flag.Bool("use-cluster-profile", false, "Use cluster-wide APIServer TLS profile (recommended)")
 	skipVersionCheck  = flag.Bool("skip-version-check", false, "Skip OpenShift version check (not recommended)")
+	enablePQC         = flag.Bool("enable-pqc", false, "Enforce post-quantum, TLS 1.3-only key exchange (X25519MLKEM768)")
+	targetNamespace   = flag.String("target-namespace", "", "Namespace of the workloads to roll out on TLS change (reconcile mode)")
+	targetDeployments = flag.String("target-deployments", "", "Comma-separated Deployment names to roll out on TLS change (reconcile mode)")
+	resyncPeriod      = flag.Duration("resync-period", 5*time.Minute, "Periodic drift-correction interval (reconcile mode)")
 )
 
 func main() {
 	flag.Parse()
 
-	ctx := context.Background()
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
 
 	// Create configuration
 	cfg := config.NewConfig()
 	cfg.Kubeconfig = *kubeconfig
 	cfg.IngressControllerName = *ingressController
 	cfg.Namespace = *namespace
+	cfg.EnablePQC = *enablePQC
+	cfg.TargetNamespace = *targetNamespace
+	cfg.TargetDeployments = parseCiphers(*targetDeployments)
+	cfg.ResyncPeriod = *resyncPeriod
+
+	// The reconcile action runs its own long-lived controller and does not use
+	// the one-shot TLSController.
+	if *action == "reconcile" {
+		if err := reconcileAction(ctx, cfg); err != nil {
+			log.Fatalf("Reconciler failed: %v", err)
+		}
+		return
+	}
 
 	// Create controller
 	ctrl, err := controller.NewTLSController(cfg)
@@ -86,9 +108,73 @@ func main() {
 		if err := checkVersionAction(ctx, ctrl); err != nil {
 			log.Fatalf("Failed to check version: %v", err)
 		}
+	case "validate":
+		if err := validateAction(ctx, cfg); err != nil {
+			log.Fatalf("PQC/TLS 1.3 compliance check failed: %v", err)
+		}
 	default:
-		log.Fatalf("Unknown action: %s. Valid actions are: get, update, list, get-cluster, show-tlsconfig, check-version", *action)
+		log.Fatalf("Unknown action: %s. Valid actions are: get, update, list, get-cluster, show-tlsconfig, check-version, validate, reconcile", *action)
 	}
+}
+
+// reconcileAction runs the long-lived reconciler that rolls target workloads
+// whenever the cluster-wide TLS profile changes at runtime.
+func reconcileAction(ctx context.Context, cfg *config.Config) error {
+	r, err := reconcile.NewReconciler(cfg)
+	if err != nil {
+		return err
+	}
+	return r.Run(ctx)
+}
+
+// validateAction reports whether the effective cluster TLS configuration is
+// post-quantum and TLS 1.3-only compliant. It exits non-zero when it is not.
+func validateAction(ctx context.Context, cfg *config.Config) error {
+	k8sConfig, err := config.GetKubeConfig(cfg.Kubeconfig)
+	if err != nil {
+		return fmt.Errorf("failed to get kubernetes config: %w", err)
+	}
+
+	apiServerClient, err := client.NewAPIServerClient(k8sConfig)
+	if err != nil {
+		return fmt.Errorf("failed to create APIServer client: %w", err)
+	}
+
+	profile, err := apiServerClient.GetEffectiveTLSProfile(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to get cluster TLS profile: %w", err)
+	}
+
+	// Evaluate the profile as it would be enforced with PQC enabled.
+	tlsConfig, err := crypto.ConvertTLSProfileWithPQC(profile, true)
+	if err != nil {
+		return fmt.Errorf("failed to convert TLS profile: %w", err)
+	}
+
+	compliant, reasons := crypto.IsPQCCompliant(tlsConfig)
+
+	fmt.Println("Post-Quantum / TLS 1.3 Compliance Check")
+	fmt.Println("=======================================")
+	fmt.Printf("MinVersion:       %s\n", tlsVersionName(tlsConfig.MinVersion))
+	fmt.Printf("Key-exchange:     ")
+	for i, c := range tlsConfig.CurvePreferences {
+		if i > 0 {
+			fmt.Print(", ")
+		}
+		fmt.Print(crypto.CurveName(c))
+	}
+	fmt.Println()
+
+	if compliant {
+		fmt.Println("\n✅ Status: COMPLIANT (post-quantum, TLS 1.3)")
+		return nil
+	}
+
+	fmt.Println("\n❌ Status: NON-COMPLIANT")
+	for _, r := range reasons {
+		fmt.Printf("   - %s\n", r)
+	}
+	return fmt.Errorf("configuration is not PQC/TLS 1.3 compliant")
 }
 
 func getAction(ctx context.Context, ctrl *controller.TLSController) error {
@@ -128,6 +214,17 @@ func updateAction(ctx context.Context, ctrl *controller.TLSController) error {
 
 		tlsConfig.Ciphers = parseCiphers(*ciphers)
 		tlsConfig.MinTLSVersion = configv1.TLSProtocolVersion(*minTLSVersion)
+	}
+
+	// Post-quantum key exchange is only defined for TLS 1.3, so enforce it.
+	if *enablePQC {
+		tlsConfig.EnablePQC = true
+		if profileType == configv1.TLSProfileCustomType {
+			tlsConfig.MinTLSVersion = configv1.VersionTLS13
+		}
+		log.Printf("PQC enabled: enforcing TLS 1.3 and X25519MLKEM768 key exchange")
+		log.Printf("Note: the OpenShift TLSSecurityProfile API cannot store key-exchange groups; " +
+			"the PQC group is negotiated by the Go runtime (>=1.24) and recorded in the workload rollout hash")
 	}
 
 	// Apply the configuration
@@ -255,7 +352,7 @@ func showTLSConfigAction(ctx context.Context, cfg *config.Config) error {
 	fmt.Println()
 
 	// Convert to crypto/tls.Config
-	tlsConfig, err := crypto.ConvertTLSProfile(profile)
+	tlsConfig, err := crypto.ConvertTLSProfileWithPQC(profile, *enablePQC)
 	if err != nil {
 		return fmt.Errorf("failed to convert TLS profile: %w", err)
 	}
@@ -268,6 +365,16 @@ func showTLSConfigAction(ctx context.Context, cfg *config.Config) error {
 	fmt.Printf("PreferServerCipherSuites: %v\n", tlsConfig.PreferServerCipherSuites)
 	fmt.Printf("SessionTicketsDisabled: %v\n", tlsConfig.SessionTicketsDisabled)
 	fmt.Printf("Renegotiation: %s\n", renegotiationName(tlsConfig.Renegotiation))
+	if len(tlsConfig.CurvePreferences) > 0 {
+		fmt.Printf("Key-exchange groups: ")
+		for i, c := range tlsConfig.CurvePreferences {
+			if i > 0 {
+				fmt.Print(", ")
+			}
+			fmt.Print(crypto.CurveName(c))
+		}
+		fmt.Println()
+	}
 	fmt.Printf("\nCipher Suites (%d configured):\n", len(tlsConfig.CipherSuites))
 	for i, suite := range tlsConfig.CipherSuites {
 		fmt.Printf("  %2d. %s (0x%04x)\n", i+1, cipherSuiteName(suite), suite)
@@ -316,26 +423,26 @@ func renegotiationName(r tls.RenegotiationSupport) string {
 
 func cipherSuiteName(id uint16) string {
 	names := map[uint16]string{
-		tls.TLS_AES_128_GCM_SHA256:                      "TLS_AES_128_GCM_SHA256",
-		tls.TLS_AES_256_GCM_SHA384:                      "TLS_AES_256_GCM_SHA384",
-		tls.TLS_CHACHA20_POLY1305_SHA256:                "TLS_CHACHA20_POLY1305_SHA256",
-		tls.TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256:     "TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256",
-		tls.TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256:       "TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256",
-		tls.TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384:     "TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384",
-		tls.TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384:       "TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384",
+		tls.TLS_AES_128_GCM_SHA256:                        "TLS_AES_128_GCM_SHA256",
+		tls.TLS_AES_256_GCM_SHA384:                        "TLS_AES_256_GCM_SHA384",
+		tls.TLS_CHACHA20_POLY1305_SHA256:                  "TLS_CHACHA20_POLY1305_SHA256",
+		tls.TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256:       "TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256",
+		tls.TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256:         "TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256",
+		tls.TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384:       "TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384",
+		tls.TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384:         "TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384",
 		tls.TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256: "TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305",
-		tls.TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256: "TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305",
-		tls.TLS_ECDHE_ECDSA_WITH_AES_128_CBC_SHA256:     "TLS_ECDHE_ECDSA_WITH_AES_128_CBC_SHA256",
-		tls.TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA256:       "TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA256",
-		tls.TLS_ECDHE_ECDSA_WITH_AES_128_CBC_SHA:        "TLS_ECDHE_ECDSA_WITH_AES_128_CBC_SHA",
-		tls.TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA:          "TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA",
-		tls.TLS_ECDHE_ECDSA_WITH_AES_256_CBC_SHA:        "TLS_ECDHE_ECDSA_WITH_AES_256_CBC_SHA",
-		tls.TLS_ECDHE_RSA_WITH_AES_256_CBC_SHA:          "TLS_ECDHE_RSA_WITH_AES_256_CBC_SHA",
-		tls.TLS_RSA_WITH_AES_128_GCM_SHA256:             "TLS_RSA_WITH_AES_128_GCM_SHA256",
-		tls.TLS_RSA_WITH_AES_256_GCM_SHA384:             "TLS_RSA_WITH_AES_256_GCM_SHA384",
-		tls.TLS_RSA_WITH_AES_128_CBC_SHA256:             "TLS_RSA_WITH_AES_128_CBC_SHA256",
-		tls.TLS_RSA_WITH_AES_128_CBC_SHA:                "TLS_RSA_WITH_AES_128_CBC_SHA",
-		tls.TLS_RSA_WITH_AES_256_CBC_SHA:                "TLS_RSA_WITH_AES_256_CBC_SHA",
+		tls.TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256:   "TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305",
+		tls.TLS_ECDHE_ECDSA_WITH_AES_128_CBC_SHA256:       "TLS_ECDHE_ECDSA_WITH_AES_128_CBC_SHA256",
+		tls.TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA256:         "TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA256",
+		tls.TLS_ECDHE_ECDSA_WITH_AES_128_CBC_SHA:          "TLS_ECDHE_ECDSA_WITH_AES_128_CBC_SHA",
+		tls.TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA:            "TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA",
+		tls.TLS_ECDHE_ECDSA_WITH_AES_256_CBC_SHA:          "TLS_ECDHE_ECDSA_WITH_AES_256_CBC_SHA",
+		tls.TLS_ECDHE_RSA_WITH_AES_256_CBC_SHA:            "TLS_ECDHE_RSA_WITH_AES_256_CBC_SHA",
+		tls.TLS_RSA_WITH_AES_128_GCM_SHA256:               "TLS_RSA_WITH_AES_128_GCM_SHA256",
+		tls.TLS_RSA_WITH_AES_256_GCM_SHA384:               "TLS_RSA_WITH_AES_256_GCM_SHA384",
+		tls.TLS_RSA_WITH_AES_128_CBC_SHA256:               "TLS_RSA_WITH_AES_128_CBC_SHA256",
+		tls.TLS_RSA_WITH_AES_128_CBC_SHA:                  "TLS_RSA_WITH_AES_128_CBC_SHA",
+		tls.TLS_RSA_WITH_AES_256_CBC_SHA:                  "TLS_RSA_WITH_AES_256_CBC_SHA",
 	}
 
 	if name, ok := names[id]; ok {

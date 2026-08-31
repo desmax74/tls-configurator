@@ -8,8 +8,37 @@ import (
 	configv1 "github.com/openshift/api/config/v1"
 )
 
+// PQCCurvePreferences returns the post-quantum key-exchange groups to negotiate,
+// most-preferred first. X25519MLKEM768 is the hybrid group (classical X25519 +
+// ML-KEM-768, NIST FIPS 203) enabled by default in Go's crypto/tls since Go 1.24;
+// plain X25519 is kept as the classical fallback for peers without PQC support.
+func PQCCurvePreferences() []tls.CurveID {
+	return []tls.CurveID{
+		tls.X25519MLKEM768,
+		tls.X25519,
+	}
+}
+
 // ConvertTLSProfile converts an OpenShift TLS security profile to a crypto/tls.Config
 func ConvertTLSProfile(profile *configv1.TLSSecurityProfile) (*tls.Config, error) {
+	return ConvertTLSProfileWithPQC(profile, false)
+}
+
+// ConvertTLSProfileWithPQC converts an OpenShift TLS security profile to a
+// crypto/tls.Config, optionally enforcing post-quantum, TLS 1.3-only settings.
+func ConvertTLSProfileWithPQC(profile *configv1.TLSSecurityProfile, enablePQC bool) (*tls.Config, error) {
+	tlsConfig, err := convertTLSProfile(profile)
+	if err != nil {
+		return nil, err
+	}
+	if enablePQC {
+		EnablePQC(tlsConfig)
+	}
+	return tlsConfig, nil
+}
+
+// convertTLSProfile converts an OpenShift TLS security profile to a crypto/tls.Config
+func convertTLSProfile(profile *configv1.TLSSecurityProfile) (*tls.Config, error) {
 	if profile == nil {
 		// Use default intermediate profile
 		return GetDefaultTLSConfig(), nil
@@ -140,6 +169,84 @@ func SecureTLSConfig(config *tls.Config) {
 
 	// Note: We don't override MinVersion here to allow Old profile
 	// to use TLS 1.0/1.1 if explicitly configured
+}
+
+// EnablePQC hardens a crypto/tls.Config for post-quantum key exchange.
+// It forces the minimum protocol version to TLS 1.3 (hybrid PQC key exchange is
+// only defined for TLS 1.3) and sets the key-exchange group preferences to the
+// post-quantum list. The symmetric cipher suites are left untouched: for TLS 1.3
+// Go selects its AEAD suites internally and ignores Config.CipherSuites, and
+// those suites are already quantum-resistant at the symmetric level.
+func EnablePQC(config *tls.Config) {
+	if config == nil {
+		return
+	}
+	if config.MinVersion < tls.VersionTLS13 {
+		config.MinVersion = tls.VersionTLS13
+	}
+	config.CurvePreferences = PQCCurvePreferences()
+}
+
+// IsPQCCompliant reports whether a crypto/tls.Config negotiates post-quantum,
+// TLS 1.3-only key exchange. When it is not compliant, the returned reasons
+// explain what is missing.
+func IsPQCCompliant(config *tls.Config) (bool, []string) {
+	if config == nil {
+		return false, []string{"tls config is nil"}
+	}
+
+	var reasons []string
+	if config.MinVersion < tls.VersionTLS13 {
+		reasons = append(reasons, fmt.Sprintf("MinVersion is %s, must be TLS 1.3", tlsVersionString(config.MinVersion)))
+	}
+
+	hasPQCGroup := false
+	for _, c := range config.CurvePreferences {
+		if c == tls.X25519MLKEM768 {
+			hasPQCGroup = true
+			break
+		}
+	}
+	if !hasPQCGroup {
+		reasons = append(reasons, "CurvePreferences does not include X25519MLKEM768")
+	}
+
+	return len(reasons) == 0, reasons
+}
+
+// CurveName returns a human-readable name for a TLS key-exchange group.
+func CurveName(id tls.CurveID) string {
+	switch id {
+	case tls.X25519MLKEM768:
+		return "X25519MLKEM768"
+	case tls.X25519:
+		return "X25519"
+	case tls.CurveP256:
+		return "CurveP256"
+	case tls.CurveP384:
+		return "CurveP384"
+	case tls.CurveP521:
+		return "CurveP521"
+	default:
+		return fmt.Sprintf("Unknown(0x%04x)", uint16(id))
+	}
+}
+
+func tlsVersionString(version uint16) string {
+	switch version {
+	case tls.VersionTLS10:
+		return "TLS 1.0"
+	case tls.VersionTLS11:
+		return "TLS 1.1"
+	case tls.VersionTLS12:
+		return "TLS 1.2"
+	case tls.VersionTLS13:
+		return "TLS 1.3"
+	case 0:
+		return "unset"
+	default:
+		return fmt.Sprintf("Unknown(0x%04x)", version)
+	}
 }
 
 // GetDefaultTLSConfig returns the default (Intermediate) TLS configuration

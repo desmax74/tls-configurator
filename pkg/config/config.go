@@ -3,6 +3,7 @@ package config
 import (
 	"fmt"
 	"os"
+	"time"
 
 	configv1 "github.com/openshift/api/config/v1"
 	operatorv1 "github.com/openshift/api/operator/v1"
@@ -17,6 +18,15 @@ type Config struct {
 	IngressControllerName string
 	Namespace             string
 	TLSProfile            *configv1.TLSSecurityProfile
+
+	// EnablePQC requests post-quantum, TLS 1.3-only key exchange for converted
+	// crypto/tls.Config values and for reconciliation.
+	EnablePQC bool
+
+	// Runtime reconciliation settings (used by the "reconcile" action).
+	TargetNamespace   string        // namespace of the workloads to roll out
+	TargetDeployments []string      // deployment names to annotate on TLS change
+	ResyncPeriod      time.Duration // periodic drift-correction interval
 }
 
 // TLSConfig represents the desired TLS configuration
@@ -24,6 +34,12 @@ type TLSConfig struct {
 	Type          configv1.TLSProfileType
 	Ciphers       []string
 	MinTLSVersion configv1.TLSProtocolVersion
+
+	// EnablePQC forces TLS 1.3 and advertises the post-quantum key-exchange
+	// group. Note: the pinned OpenShift TLSSecurityProfile API cannot express
+	// key-exchange groups, so this only affects converted crypto/tls.Config
+	// values and the compliance hash, not the IngressController profile fields.
+	EnablePQC bool
 }
 
 // NewConfig creates a new Config with default values
